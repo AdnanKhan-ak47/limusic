@@ -1920,6 +1920,11 @@ impl AppState {
                     }
                 } else {
                     tracing::info!("queue exhausted");
+                    // The playlist is over, so it is nobody's context any more: with it kept, the
+                    // playlist card's Play still read as "resume" and replayed the last track
+                    // instead of starting over (#528).
+                    me.queue.lock().await.source_id = None;
+                    me.emit_queue().await;
                     let _ = me.app.emit("playback-state", "paused");
                     // mpv goes idle without flipping its pause flag, so no Paused event will fire
                     // — tell the OS widget + Discord ourselves or they show "playing" forever
