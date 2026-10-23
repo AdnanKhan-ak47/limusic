@@ -1249,6 +1249,7 @@ impl AppState {
                 // the cache window (hours, and every track you just listened to) would fall back
                 // to the queue row's flag, which is exactly the thing that can't be trusted.
                 is_video: c.is_video,
+                live: false, // never written to the cache, see below
                 stream_client: c.client.unwrap_or_else(|| "cache".to_owned()),
             });
         }
@@ -1261,7 +1262,10 @@ impl AppState {
         //
         // Nor upload URLs: they expire in minutes (32 seconds without the MLPT context), and the
         // read above only accepts a row with 60s of life left, so the write is dead on arrival.
-        if data.stream_client != "rustypipe" && !is_upload {
+        //
+        // Nor a live playlist (#424): the broadcast it describes can end and the recording take
+        // its videoId within the cache window, and a replay then needs a real `/player` answer.
+        if data.stream_client != "rustypipe" && !is_upload && !data.live {
             self.db.put_stream(
                 video_id,
                 &crate::db::CachedStream {
@@ -2209,9 +2213,13 @@ impl AppState {
             .filter(|(vid, _)| *vid == item.video_id)
             .map(|(_, pos)| pos);
         let stream_url = mpv_stream_url(&data);
-        if let Err(e) =
-            self.player.load(&stream_url, &data.headers, self.track_gain(data.loudness_db), seek)
-        {
+        if let Err(e) = self.player.load(
+            &stream_url,
+            &data.headers,
+            self.track_gain(data.loudness_db),
+            seek,
+            data.live,
+        ) {
             self.emit_error(&item.video_id, &e.to_string());
             return false;
         }
@@ -2229,7 +2237,8 @@ impl AppState {
             data.artists.as_deref(),
             data.is_video,
         );
-        self.attach_video(&item.video_id, item.is_video, &stream_url);
+        // A broadcast's picture is segment bases too (#424), so there is no 720p file to pair.
+        self.attach_video(&item.video_id, item.is_video && !data.live, &stream_url);
         {
             let mut q = self.queue.lock().await;
             q.current_client = Some(data.stream_client.clone());
@@ -2373,6 +2382,13 @@ impl AppState {
                 index = next_idx,
                 "lookahead already primed by a concurrent resolve — dropped"
             );
+            return;
+        }
+        // A broadcast is not appended (#424): the player's `load` is what knows a URL is live, and
+        // an appended entry inherits the file options and duration handling of the track before
+        // it. Left unprimed, it is reached through `start_current` like a first play.
+        if data.live {
+            tracing::debug!(index = next_idx, "next track is live, not primed");
             return;
         }
         // Headers are global in mpv; the direct-URL clients need none beyond UA, which the
@@ -3467,6 +3483,7 @@ impl AppState {
             &data.headers,
             self.track_gain(data.loudness_db),
             (pos > 0.5).then_some(pos),
+            data.live,
         ) {
             self.emit_error(&track.id, &e.to_string());
             return;
@@ -4719,7 +4736,10 @@ fn mpv_stream_url(data: &PlaybackData) -> String {
     // googlevideo URL instead and let the user's proxy carry it: no chunked proxy, but working
     // playback. Nothing else is lost, because the proxy's own upstream fetch already goes through
     // `http::client()`, which is proxied.
-    if crate::http::has_proxy() {
+    //
+    // A live playlist (#424) goes direct too: the chunking proxy serves one byte-range file per
+    // registration, and a playlist is text that names other URLs, which mpv has to fetch itself.
+    if crate::http::has_proxy() || data.live {
         return data.stream_url.clone();
     }
     let http = data.stream_url.starts_with("http://") || data.stream_url.starts_with("https://");
